@@ -2262,7 +2262,12 @@ class FlashAttentionForwardHd256_1CTA_Sm100:
 
             qk_descale, _ = self._load_effective_descales(descale_tensors, batch_idx, kv_head_idx)
 
-            max_offset = 8 if cutlass.const_expr(self.q_dtype.width == 8) else 0
+            # fp8: P is scaled by 2^max_offset before the e4m3 cast so small probs don't
+            # underflow. With the rescale_threshold optimization the row_max used for a block
+            # can lag the true max by up to `rescale_threshold` (log2 units), so a P entry can
+            # reach 2^(max_offset + rescale_threshold). This must stay < e4m3 max (448 ≈ 2^8.8)
+            # or the dominant probs saturate and accuracy collapses. Keep max_offset + threshold <= 8.
+            max_offset = 4 if cutlass.const_expr(self.q_dtype.width == 8) else 0
             if const_expr(self.score_mod is None):
                 softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
                 softmax_scale_eff = None
@@ -2864,9 +2869,10 @@ class FlashAttentionForwardHd256_1CTA_Sm100:
             else:
                 softmax_scale_log2_eff = softmax_scale_log2
 
-            max_offset = Float32(8.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(0.0)
+            # Must match the P-path max_offset above (2^max_offset). See note there.
+            max_offset = Float32(4.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(0.0)
             max_offset_scale = (
-                Float32(256.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(1.0)
+                Float32(16.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(1.0)
             )
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
