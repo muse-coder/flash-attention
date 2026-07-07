@@ -1,0 +1,38 @@
+==PROF== Connected to process 394758 (/usr/bin/python3.12)
+==PROF== Profiling "kernel_cutlass_kernel_flash_attncuteflash_fwd_hd256_1cta_sm100FlashAttentionForwardHd256_1CTA_Sm100_object_at__tensor000o111012_tensor000o111012_tensor000o101112_tensorptrbf16gmemalign16o_0": 0%....50%....100% - 15 passes
+==PROF== Disconnected from process 394758
+[394758] python3.12@127.0.0.1
+  kernel_cutlass_kernel_flash_attncuteflash_fwd_hd256_1cta_sm100FlashAttentionForwardHd256_1CTA_Sm100_object_at__tensor000o111012_tensor000o111012_tensor000o101112_tensorptrbf16gmemalign16o_0 (2048, 1, 1)x(320, 1, 1), Context 1, Stream 7, Device 0, CC 10.3
+    Section: GPU Speed Of Light Throughput
+    ----------------------- ----------- ------------
+    Metric Name             Metric Unit Metric Value
+    ----------------------- ----------- ------------
+    DRAM Frequency                  Ghz         4.00
+    SM Frequency                    Ghz         1.79
+    Elapsed Cycles                cycle       783613
+    Memory Throughput                 %        37.31
+    DRAM Throughput                   %         4.81
+    Duration                         us       435.36
+    L1/TEX Cache Throughput           %        45.60
+    L2 Cache Throughput               %        37.28
+    SM Active Cycles              cycle    757521.05
+    Compute (SM) Throughput           %        60.99
+    ----------------------- ----------- ------------
+
+    OPT   Compute is more heavily utilized than Memory: Look at the Compute Workload Analysis section to see what the   
+          compute pipelines are spending their time doing. Also, consider whether any computation is redundant and      
+          could be reduced or moved to look-up tables.                                                                  
+
+    Section: Warp State Statistics
+    ---------------------------------------- ----------- ------------
+    Metric Name                              Metric Unit Metric Value
+    ---------------------------------------- ----------- ------------
+    Warp Cycles Per Issued Instruction             cycle         6.55
+    Warp Cycles Per Executed Instruction           cycle         6.55
+    Avg. Active Threads Per Warp                                31.79
+    Avg. Not Predicated Off Threads Per Warp                    31.07
+    ---------------------------------------- ----------- ------------
+
+    WRN   The optional metric smsp__pcsamp_sample_count could not be found. Collecting it as an additional metric could 
+          enable the rule to provide more guidance.                                                                     
+

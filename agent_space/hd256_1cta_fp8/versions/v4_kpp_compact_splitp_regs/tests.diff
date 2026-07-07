@@ -1,0 +1,59 @@
+diff --git a/tests/cute/test_flash_attn_varlen.py b/tests/cute/test_flash_attn_varlen.py
+index ad6dcd6..6569be4 100644
+--- a/tests/cute/test_flash_attn_varlen.py
++++ b/tests/cute/test_flash_attn_varlen.py
+@@ -1,4 +1,5 @@
+ from typing import Optional
++import os
+ import pytest
+ 
+ import torch
+@@ -48,6 +49,48 @@ def test_varlen(
+     )
+     assert ok
+ 
++
++def test_varlen_hd256_fp8_1cta_sm100_oracle():
++    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 11):
++        pytest.skip("SM100/SM110-specific hd256 fp8 1CTA regression test")
++
++    torch.manual_seed(0)
++    fp8 = torch.float8_e4m3fn
++    seqlen, nheads_q, nheads_kv, d = 256, 4, 1, 256
++    q = torch.randn(seqlen, nheads_q, d, device="cuda", dtype=torch.bfloat16).to(fp8)
++    k = torch.randn(seqlen, nheads_kv, d, device="cuda", dtype=torch.bfloat16).to(fp8)
++    v = torch.randn(seqlen, nheads_kv, d, device="cuda", dtype=torch.bfloat16).to(fp8)
++    cu_seqlens = torch.tensor([0, seqlen], device="cuda", dtype=torch.int32)
++
++    def run(use_main):
++        old = os.environ.get("FA_HD256_USE_MAIN")
++        os.environ["FA_HD256_USE_MAIN"] = "1" if use_main else "0"
++        try:
++            out, _ = flash_attn_varlen_func(
++                q,
++                k,
++                v,
++                cu_seqlens_q=cu_seqlens,
++                cu_seqlens_k=cu_seqlens,
++                max_seqlen_q=seqlen,
++                max_seqlen_k=seqlen,
++                softmax_scale=1.0 / d**0.5,
++                causal=True,
++                pack_gqa=False,
++            )
++        finally:
++            if old is None:
++                os.environ.pop("FA_HD256_USE_MAIN", None)
++            else:
++                os.environ["FA_HD256_USE_MAIN"] = old
++        return out.float()
++
++    out_main = run(use_main=True)
++    out_new = run(use_main=False)
++    diff = (out_new - out_main).abs().max().item()
++    ref = out_main.abs().max().item()
++    assert diff <= 1e-2 + 0.02 * ref
++
+ def check_varlen_vs_torch_flash(
+     q, k, v,
+     cu_seqlens_q=None,

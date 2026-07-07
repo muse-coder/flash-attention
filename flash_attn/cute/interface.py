@@ -37,6 +37,7 @@ from flash_attn.cute.cute_dsl_utils import (
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
+from flash_attn.cute.flash_fwd_hd256_1cta_sm100 import FlashAttentionForwardHd256_1CTA_Sm100
 from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
@@ -464,6 +465,9 @@ def _flash_attn_fwd(
     requires_grad = any(t is not None and t.requires_grad for t in [q, k, v, qv])
     if is_fp8 and requires_grad:
         raise NotImplementedError("FA4 CuTe FP8 backward is not supported yet (forward-only).")
+    use_fp8_hd256_1cta = (
+        arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256 and is_fp8
+    )
     out_torch_dtype = torch.bfloat16 if is_fp8 else q_dtype
     device = v.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
@@ -553,10 +557,20 @@ def _flash_attn_fwd(
     if cu_seqlens_k is None and seqused_k is None:
         min_seqlen_k = seqlen_k 
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
+    # [hd256-1cta-fp8 spike] fp8 hd256 goes through the general SM100 kernel as 1-CTA q_stage=1
+    # (tmem fits exactly: S 2x128 + O 256 = 512). Non-fp8 hd256 still uses the 2-CTA dedicated kernel.
+    use_fp8_hd256_main = use_fp8_hd256_1cta and os.environ.get("FA_HD256_USE_MAIN", "0") == "1"
+    fwd_kernel_variant = (
+        "hd256_fp8_main"
+        if use_fp8_hd256_main
+        else "hd256_fp8_1cta" if use_fp8_hd256_1cta else "default"
+    )
     if arch // 10 in [10, 11]:
         q_stage = 2 if seqlen_q_packgqa > tile_m else 1
     else:
         q_stage = 1
+    if use_fp8_hd256_1cta:
+        q_stage = 1  # hd256 1-CTA only fits tmem with a single Q tile
 
     m_block_size_effective = q_stage * tile_m
     seqlen_k_loaded = max_seqlen_k if not local else max(0, min(max_seqlen_k, (window_size_right or max_seqlen_k) + (window_size_left or max_seqlen_k) + 1 + tile_m))
@@ -598,8 +612,11 @@ def _flash_attn_fwd(
         and (tile_m % qhead_per_kvhead == 0 or not pack_gqa)
     )
 
-    # hd=256 2CTA forward uses dedicated kernel (Blackwell family)
-    use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
+    # hd=256 2CTA forward uses dedicated kernel (Blackwell family), EXCEPT fp8 which uses the
+    # general 1-CTA kernel (the 2CTA dedicated kernel does not support fp8/descale).
+    use_dedicated_hd256_kernel = (
+        arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256 and not use_fp8_hd256_1cta
+    )
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
 
     if softcap is not None:
@@ -754,6 +771,7 @@ def _flash_attn_fwd(
         mma_pv_is_rs,
         intra_wg_overlap,
         use_clc_scheduler,
+        fwd_kernel_variant,
         q is not None,
         qv is not None,
         p is not None,
@@ -906,11 +924,17 @@ def _flash_attn_fwd(
                     # pack_gqa is an auto-selected optimization; disable it for hd256 kernel
                     pack_gqa = False
 
-                flash_fwd_obj_cls = (
-                    BlackwellFusedMultiHeadAttentionForward
-                    if use_dedicated_hd256_kernel
-                    else FlashAttentionForwardSm100
-                )
+                if use_dedicated_hd256_kernel:
+                    flash_fwd_obj_cls = BlackwellFusedMultiHeadAttentionForward
+                elif use_fp8_hd256_1cta:
+                    # FA_HD256_USE_MAIN=1 routes back to the general SM100 kernel (q_stage=1) to
+                    # generate a golden reference while developing the dedicated K-ping-pong kernel.
+                    if use_fp8_hd256_main:
+                        flash_fwd_obj_cls = FlashAttentionForwardSm100
+                    else:
+                        flash_fwd_obj_cls = FlashAttentionForwardHd256_1CTA_Sm100
+                else:
+                    flash_fwd_obj_cls = FlashAttentionForwardSm100
 
                 fa_fwd = flash_fwd_obj_cls(
                     head_dim,

@@ -1,0 +1,24 @@
+# v3 - True dedicated baseline after compile-key split
+
+- Content:
+  - Fixed `interface.py` compile cache aliasing by adding `fwd_kernel_variant` to the forward compile key.
+  - `FA_HD256_USE_MAIN=1` now compiles/caches the general `FlashAttentionForwardSm100` path under `hd256_fp8_main`.
+  - Default hd256 fp8 compiles/caches `FlashAttentionForwardHd256_1CTA_Sm100` under `hd256_fp8_1cta`.
+  - Working kernel restored to the v0 faithful copy, so this version is the true dedicated baseline with no KPP changes.
+- Why:
+  - Earlier in-process golden scripts first compiled the main kernel, then toggled `FA_HD256_USE_MAIN=0`.
+  - Because the compile key did not include the selected forward class, the dedicated path could reuse the main kernel CUBIN.
+- Golden:
+  - `golden_cmp.py` PASS for all listed shapes, new-vs-main max_abs=0.0000.
+- Target shape:
+  - `target_varlen.py` PASS, `581.9 us / 1889.6 TFLOP/s`.
+  - NCU launch-only capture: kernel name contains `flash_fwd_hd256_1cta_sm100FlashAttentionForwardHd256_1CTA_Sm100`, duration `582304 ns`, block size `512`, grid size `2048`, registers/thread `128`, shared memory/block `232448` bytes.
+- FlashInfer baseline:
+  - Existing trtllm-gen baseline from `bench_flashinfer_trtllm_prefill.py`: fp8 output about `481.9 us`, bf16 output about `524.8 us`.
+  - Since FA4 writes bf16 output, the 10% faster target is about `<=472 us` against bf16-output FlashInfer.
+- KPP status:
+  - Re-running the uncommitted KPP/compaction state after the cache-key fix produced a launch failure on the first `golden_cmp.py` shape.
+  - Treat v1/v2 KPP performance/correctness claims as suspect until revalidated with the split compile key.
+- Next:
+  - Re-introduce KPP only on the target causal-varlen path, leaving non-target shapes on the faithful-copy schedule.
+  - Profile the true dedicated baseline and avoid using timings unless NCU/kernel-name evidence proves the dedicated class launched.

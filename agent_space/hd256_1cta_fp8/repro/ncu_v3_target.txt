@@ -1,0 +1,4 @@
+==PROF== Connected to process 330400 (/usr/bin/python3.12)
+==PROF== Profiling "kernel_cutlass_kernel_flash_a..." - 0 (1/1): 0%....50%....100% - 8 passes
+==PROF== Disconnected from process 330400
+==PROF== Report: /home/mudi/flash-attention/agent_space/hd256_1cta_fp8/repro/ncu_v3_target.ncu-rep
