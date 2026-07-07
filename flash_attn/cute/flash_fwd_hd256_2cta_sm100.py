@@ -1,13 +1,14 @@
-# Dedicated hd256 1-CTA fp8 forward kernel (SM100/SM103, B300).
-# Derived from flash_fwd_sm100.py (FlashAttentionForwardSm100), specialized for:
-# - FP8 (e4m3) dtype, external descale == 1 (no descale plumbing)
-# - head_dim == head_dim_v == 256, single CTA (use_2cta_instrs=False), q_stage == 1
-#   (single 128-row Q tile; tmem = S 2x128 + O 256 = 512 cols)
-# - noncausal & causal attention, varlen, MHA/GQA/MQA
-# Novel scheduling (vs the q_stage=2 parent): S is double-buffered along the K axis
-#   (K-ping-pong) so QK(block i+1) overlaps softmax(block i); both PV paths accumulate
-#   into a single O with a single running max/sum.
-# See agent_space/hd256_1cta_fp8/{PLAN.md,NOTES.md}.
+# Dedicated hd256 2-CTA fp8 forward kernel (SM100/SM103, B300) — minimal-sync pair-UMMA.
+# WORK IN PROGRESS. At stage S0 this file is a byte-faithful copy of the 1-CTA v4 kernel
+# (only the class name differs); it still runs as 1-CTA. Subsequent stages (S1..S6) convert
+# it to a 2-CTA pair-UMMA design where:
+# - a CTA pair (cluster=(2,1)) processes M=256 (two 128-row Q tiles), pair-UMMA (cta_group::2)
+#   for QK and PV -> ~100% tensor peak vs M=128's ~50%.
+# - accumulators split along M -> S/softmax/P/O stay CTA-local: NO cross-CTA sync in softmax.
+# - K/V shared via TMA multicast (same-parity), halving operand DRAM traffic.
+# - only 3 required syncs: K/V multicast mbarrier, pair-UMMA arrival, symmetric tmem alloc/dealloc.
+# FP8 (e4m3, external descale==1), head_dim==head_dim_v==256, causal/noncausal, varlen, MHA/GQA/MQA.
+# See agent_space/hd256_2cta_fp8/{PLAN.md,NOTES.md}. 1-CTA baseline: agent_space/hd256_1cta_fp8/.
 # Based on the cutlass example and cute-dsl example:
 # https://github.com/NVIDIA/cutlass/tree/main/examples/77_blackwell_fmha
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
@@ -116,7 +117,7 @@ class DescaleTensors(NamedTuple):
         return DescaleTensors(*((*values, None, None, None)[:3]))
 
 
-class FlashAttentionForwardHd256_1CTA_Sm100:
+class FlashAttentionForwardHd256_2CTA_Sm100:
 
     def __init__(
         self,
@@ -310,7 +311,9 @@ class FlashAttentionForwardHd256_1CTA_Sm100:
             self.load_warp_ids = (9,)
             self.empty_warp_ids = ()
         elif self.q_stage == 1 and self.use_tma_KV and self.use_tma_Q:
-            # [fair-compare] non-causal TMA-O path compaction (16->11), matches 2cta tuning.
+            # [2cta tuning] non-causal TMA-O path: q_stage=1 leaves softmax1 idle.
+            # Compact 16->11 warps (keep a standalone epilogue warp for TMA-O store),
+            # removing the 5 parked empty/softmax1 warps to free warp slots.
             self.softmax0_warp_ids = (0, 1, 2, 3)
             self.softmax1_warp_ids = ()
             self.correction_warp_ids = (4, 5, 6, 7)

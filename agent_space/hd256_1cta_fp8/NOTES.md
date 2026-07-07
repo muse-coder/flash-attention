@@ -225,3 +225,41 @@ kernel 名：FA4 `flash_fwd_hd256_1cta...`；FI `fmhaSm103aKernel_QkvE4m3OE4m3H2
   sweep FA_EX2_FREQ {0,8,16} → 431.7/431.7/433.0us **无提升**。印证 profile:math_pipe/mio throttle≈0,exp2 非瓶颈。
 - **结论**:softmax 计算层面基本到顶。其对性能的影响是经 barrier 门控 MMA(结构性 ping-pong 深度=2),非计算低效。
   唯一残留理论杠杆:4线程 warp-reduction(绑定 MMA tmem 布局,深且不确定)。文件保持 == v4。
+
+### [v8-probe] 2026-07-07 — softmax 不在关键路径(决定性,否定双 softmax 方向)
+用户提议:hd256 1-CTA 开双 softmax(softmax0→tmem, softmax1→smem)。
+- 硬件约束:tcgen05 的 **O(PV 累加器)必须在 tmem,不能放 smem**;两份独立 O(2×256 列)装不下 512 tmem → 双独立 tile 本就不可行。P 可放 smem 但 P 不占瓶颈。
+- **关键路径探针**:在 softmax_step 注入 N 遍额外完整 softmax(t2r+reduce+exp2+r2t,写同一 tmem P,有副作用不被 DCE,随后被真值覆盖),env `FA_SM_DOUBLE=N`。干净 ncu:
+  - softmax ×1(基线):434.9us
+  - softmax ×3:432.3us
+  - softmax ×5:433.4us
+- **结论:softmax 工作量翻到 5 倍,kernel 时间几乎不变 → softmax 已被 MMA 彻底掩盖,完全不在关键路径。**
+  → **双 softmax / 任何 softmax 加速收益 ≈ 0**,不值得做。瓶颈在 MMA/张量管线侧(ping-pong 深度=2 限制 MMA 领先、O rescale 耦合),非 softmax。
+- 探针已回退,文件 == v4。
+
+### [profile] 2026-07-07 — best v4 当前瓶颈定位(NCU full sections)
+按 `/home/mudi/atrex-kernel-agent/gpu-wiki/docs/nvidia/common/profiling` 的流程，对 best v4 跑完整 NCU：
+`SpeedOfLight/ComputeWorkload/Scheduler/WarpState/Occupancy/MemoryWorkload/Instruction/PmSampling`。
+artifact 见 `repro/ncu_best_v4_bottleneck.*` 和 `repro/ncu_best_v4_bottleneck_summary.md`。
+
+关键指标：
+- Compute(SM) 61.01%，Memory 36.92%，DRAM 4.74%，L2 hit 90.97% → 不是 DRAM 带宽瓶颈。
+- Issue slots busy 35.55%，No Eligible 63.20%，eligible warps/sched 0.40，active warps/sched 2.42。
+- achieved occupancy 15.03%，register/shared-mem 都限制为 1 block/SM。
+- stall: barrier 1.90、long_scoreboard 1.45、wait 1.04、short_scoreboard 0.50 cyc/issued。
+
+结论：当前瓶颈是 **1 CTA/SM 下的 warp-specialized pipeline 同步/低 eligible-warp**，具体在单 O accumulator 周围的
+`P_full` / `O_full` / `O_rescaled` barrier 链；不是 softmax math、exp2、split-P 参数、KV stage 或 DRAM 带宽。
+下一步若继续优化，应优先尝试减少 O-rescale 同步边，而不是继续加速 softmax。
+
+### [v9] 2026-07-07 — 非causal 紧凑 bonus
+- 2cta 判据实验副产品:给 1cta 非causal 也加 16→11 紧凑 → 973→936.5us。causal 目标不受影响(431.9us,golden PASS)。
+- 2cta 方向结论:调优后 2cta(962.5)仍输 1cta(936.5),cross-CTA 同步净负担,方向关闭。详见 ../hd256_2cta_fp8/。
+
+### [Round2] 2026-07-07 — correction 关键路径 + pack_gqa,均负结果
+- **方向1 correction**:rescale_threshold sweep(FA_RESCALE_THR 4/8/16/100,干净测)→ 432.9/431.8/431.8/432.3us **全无变化**。
+  thr=100 几乎不 rescale 仍不快 → **correction rescale 不在关键路径**。(correction 探针 FA_CORR_DOUBLE 因编辑本身污染基线 702us 作废,改用此干净判据。)
+- **方向2 pack_gqa**:pack_gqa=True golden PASS 但 **562.8us,比 pack_gqa=False 432us 慢 30%** → packing 打碎并行/加索引开销,**对该 shape 有害**。
+- 澄清:干净 v9 causal 目标 = 432.4us(ncu),与 v4 一致,无回归。
+- **合并结论**:softmax(v8)、correction(round2)均证明不在关键路径;kv_stage/split_P/ex2/pack_gqa 全 null/负。
+  关键路径在 **MMA+load 流水**本身,而占用率被 tmem 锁死在 15%(1 CTA/SM)。causal 1cta v4 ≈432us 是**实际天花板**。

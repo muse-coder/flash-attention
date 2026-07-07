@@ -15,3 +15,6 @@
 | v5 | kv_stage 4→5 (overlap_sO_sQ) | 逐位一致 | ~430.1us(ncu) | **负结果**：内存非瓶颈，已回退 |
 | v6 | split_P sweep {96,64,32} | 逐位一致 | ~431us(ncu) | **负结果**：无提升，已回退 |
 | v7 | ex2 emulation sweep {0,8,16} | (计算实验) | ~432us(ncu) | **负结果**:exp2 非瓶颈,已回退 |
+| v8 | softmax 关键路径探针(FA_SM_DOUBLE) | (诊断) | softmax×5→时间不变 | **决定性**:softmax 已被掩盖,双 softmax 无用,已回退 |
+| v9 | 非causal 紧凑 bonus | causal目标不变(431.9us) | 非causal 973→936.5us | 源自2cta判据实验;causal target 0.00000 |
+| r2 | correction+pack_gqa(Round2) | correction: 逐位一致;pack_gqa golden PASS | correction null;pack_gqa 562(慢30

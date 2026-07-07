@@ -38,6 +38,7 @@ from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
 from flash_attn.cute.flash_fwd_hd256_1cta_sm100 import FlashAttentionForwardHd256_1CTA_Sm100
+from flash_attn.cute.flash_fwd_hd256_2cta_sm100 import FlashAttentionForwardHd256_2CTA_Sm100
 from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
@@ -560,9 +561,18 @@ def _flash_attn_fwd(
     # [hd256-1cta-fp8 spike] fp8 hd256 goes through the general SM100 kernel as 1-CTA q_stage=1
     # (tmem fits exactly: S 2x128 + O 256 = 512). Non-fp8 hd256 still uses the 2-CTA dedicated kernel.
     use_fp8_hd256_main = use_fp8_hd256_1cta and os.environ.get("FA_HD256_USE_MAIN", "0") == "1"
+    # [hd256-2cta-fp8] FA_HD256_2CTA=1 routes fp8 hd256 to the minimal-sync pair-UMMA kernel
+    # (agent_space/hd256_2cta_fp8). Distinct compile-key variant so it never aliases the 1-CTA CUBIN.
+    use_fp8_hd256_2cta = (
+        use_fp8_hd256_1cta
+        and not use_fp8_hd256_main
+        and os.environ.get("FA_HD256_2CTA", "0") == "1"
+    )
     fwd_kernel_variant = (
         "hd256_fp8_main"
         if use_fp8_hd256_main
+        else "hd256_fp8_2cta"
+        if use_fp8_hd256_2cta
         else "hd256_fp8_1cta" if use_fp8_hd256_1cta else "default"
     )
     if arch // 10 in [10, 11]:
@@ -618,6 +628,8 @@ def _flash_attn_fwd(
         arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256 and not use_fp8_hd256_1cta
     )
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
+    # [hd256-2cta-fp8] enable the general 2-SM (pair-UMMA) machinery for the fp8 2cta kernel.
+    use_2cta_instrs = use_2cta_instrs or use_fp8_hd256_2cta
 
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
@@ -928,9 +940,12 @@ def _flash_attn_fwd(
                     flash_fwd_obj_cls = BlackwellFusedMultiHeadAttentionForward
                 elif use_fp8_hd256_1cta:
                     # FA_HD256_USE_MAIN=1 routes back to the general SM100 kernel (q_stage=1) to
-                    # generate a golden reference while developing the dedicated K-ping-pong kernel.
+                    # generate a golden reference while developing the dedicated kernels.
+                    # FA_HD256_2CTA=1 routes to the minimal-sync pair-UMMA 2-CTA kernel.
                     if use_fp8_hd256_main:
                         flash_fwd_obj_cls = FlashAttentionForwardSm100
+                    elif use_fp8_hd256_2cta:
+                        flash_fwd_obj_cls = FlashAttentionForwardHd256_2CTA_Sm100
                     else:
                         flash_fwd_obj_cls = FlashAttentionForwardHd256_1CTA_Sm100
                 else:
