@@ -219,13 +219,7 @@ class FlashAttentionForwardHd256_1CTA_Sm100:
         self.s0_s1_barrier = False
         self.overlap_sO_sQ = (
             (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
-            (self.head_dim_v_padded >= 128 and self.is_split_kv) or
-            # [v5] hd256 1-CTA fp8 KPP target path: overlap sO with sQ to free ~32KB of smem
-            # so kv_stage can grow 4 -> 5 (deeper KV pipeline hides long_scoreboard stalls).
-            # sQ is live through the whole K loop; O is written only at the end, so reuse is safe.
-            (self.q_stage == 1 and self.is_causal and self.is_varlen_q
-             and not self.is_local and not self.is_split_kv and not self.pack_gqa
-             and self.head_dim_padded == 256 and self.head_dim_v_padded == 256)
+            (self.head_dim_v_padded >= 128 and self.is_split_kv)
         )
         if self.overlap_sO_sQ:
             self.is_persistent = False

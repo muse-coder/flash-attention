@@ -12,3 +12,6 @@
 | v2 | First K-ping-pong schedule | 逐位一致 | 1461.5 | 可运行但未提速，split-P 暂未接入 |
 | v3 | True dedicated baseline + compile-key split | 逐位一致 | 1889.6 | 修复 main/dedicated cache alias；NCU 确认真实 `FlashAttentionForwardHd256_1CTA_Sm100`，v1/v2 需重验 |
 | v4 | KPP fixed + 10-warp compact + split-P + regs | 逐位一致 | 2514.0 | ncu 重测：FA4 ~430.9us vs FI trtllm-gen fp8 ~445.4us → **快~3.3%**（旧 492us event 计时作废） |
+| v5 | kv_stage 4→5 (overlap_sO_sQ) | 逐位一致 | ~430.1us(ncu) | **负结果**：内存非瓶颈，已回退 |
+| v6 | split_P sweep {96,64,32} | 逐位一致 | ~431us(ncu) | **负结果**：无提升，已回退 |
+| v7 | ex2 emulation sweep {0,8,16} | (计算实验) | ~432us(ncu) | **负结果**:exp2 非瓶颈,已回退 |

@@ -203,3 +203,25 @@ b2 s4096 h8 d256 causal，SpeedOfLight+WarpStall：
 **修正结论**：v4 比 FI trtllm-gen fp8-out 快 **~3.3%（14.5us）**，非 11.2%。
 注意 FA4 输出 bf16（写 2× 字节）而此 FI 输出 fp8；对 FI bf16-out（~460-471us）FA4 快 ~6-8%。
 kernel 名：FA4 `flash_fwd_hd256_1cta...`；FI `fmhaSm103aKernel_QkvE4m3OE4m3H256PagedKvCausalP64VarSeqQ128Kv128PersistentContext`。
+
+### [v5-neg] 2026-07-07 — 深化 KV 流水无效（barrier-bound 确认）
+- v5 试 overlap_sO_sQ→kv_stage 5：golden PASS，但干净 ncu 430.1us ≈ v4 430.9us，无实质变化 → 已回退。
+- stall 分解（cyc/issued，总 6.54）：barrier 1.88 / long_scoreboard 1.44 / wait 1.04 / short_scoreboard 0.50。
+- 占用率：2.41 active、0.41 eligible warps/sched，63% No-Eligible。tmem 满 → 1 CTA/SM 硬顶。
+- 结论：瓶颈是 barrier 同步 + 低占用，非内存带宽/深度。下一杠杆需攻 softmax 速度/同步（高风险）。
+
+### [v6-neg] 2026-07-07 — split_P_arrive sweep 无效
+- sweep split_P_arrive ∈ {96(v4),64,32}，干净 ncu 中位：431.5 / 431.0 / 430.9us —— 全在噪声内，无提升。
+- 结论：参数旋钮（kv_stage、split_P）对 barrier-bound 瓶颈均无效。已回退，文件 == v4。
+- 结构性天花板确认：tmem 满 → 1 CTA/SM + S ping-pong 深度=2，softmax 延迟经 barrier 直接卡 MMA。
+  进一步提速只剩高风险项：(a) 加 softmax warp（更多 warp/sched + 更快 softmax 生产 P）；(b) 减少 warp-role 同步。
+
+### [softmax 计算调查] 2026-07-07 — 已高度优化,exp2 非瓶颈
+应用户"softmax 计算还能提速吗"深入排查 softmax_step + softmax.py:
+- **已有优化(确认)**:① P 生产不依赖 row_sum,`update_row_sum` 在 commit P **之后**(line 2769-2770)→ row_sum 不在 MMA-解锁关键路径;
+  ② causal masked/full 块分离(内部满块不套 mask,line 2461);③ 硬件 exp2(sm103, ex2_emu_freq=0);
+  ④ packed FMA(fma_packed_f32x2);⑤ split-P 早放行(96);⑥ correction 经 sm_stats_barrier 早通知 row_max。
+- **实验 ex2 emulation**(把部分 exp2 从 SFU 挪到 FMA,FA4 对 hd256-2cta 用 freq=14):
+  sweep FA_EX2_FREQ {0,8,16} → 431.7/431.7/433.0us **无提升**。印证 profile:math_pipe/mio throttle≈0,exp2 非瓶颈。
+- **结论**:softmax 计算层面基本到顶。其对性能的影响是经 barrier 门控 MMA(结构性 ping-pong 深度=2),非计算低效。
+  唯一残留理论杠杆:4线程 warp-reduction(绑定 MMA tmem 布局,深且不确定)。文件保持 == v4。
