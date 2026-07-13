@@ -322,6 +322,20 @@ class FlashAttentionForwardHd256_2CTA_Sm100:
             self.load_warp_ids = (10,)
             self.empty_warp_ids = ()
 
+        # The compact hd256 FP8 layouts deliberately remove every parked warp.
+        # CLC still needs one dedicated producer warp to issue work queries, so
+        # append it only to the CLC specialization instead of making the static
+        # fast path pay for an otherwise idle warp.
+        if self.use_clc_scheduler and not self.empty_warp_ids:
+            used_warp_ids = (
+                *self.softmax0_warp_ids,
+                *self.softmax1_warp_ids,
+                *self.correction_warp_ids,
+                self.mma_warp_id,
+                *self.load_warp_ids,
+                *(() if self.epilogue_warp_ids == self.correction_warp_ids else self.epilogue_warp_ids),
+            )
+            self.empty_warp_ids = (max(used_warp_ids) + 1,)
         self.clc_scheduler_warp_id = self.empty_warp_ids[0] if self.use_clc_scheduler else None
 
         self.threads_per_cta = cute.arch.WARP_SIZE * len(
@@ -1144,8 +1158,11 @@ class FlashAttentionForwardHd256_2CTA_Sm100:
         )
 
         block_info = BlockInfo(
-            # This is cta_tiler, not mma_tiler_qk, since we move by block by (2 * mma_tiler[0], mma_tiler[1])
-            self.cta_tiler[0],
+            # The scheduler's m_block indexes one cluster tile.  With 2-CTA
+            # instructions that tile covers both 128-row CTA slices, so causal
+            # K-block bounds must be computed from the 256-row union.  Using the
+            # per-CTA size here makes CTA1 silently miss its later K blocks.
+            self.cta_tiler[0] * self.cta_group_size,
             self.cta_tiler[1],
             self.is_causal,
             self.is_local,
@@ -1758,6 +1775,10 @@ class FlashAttentionForwardHd256_2CTA_Sm100:
         kpp_o_rescaled_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, 1
         )
+        # K-ping-pong slot parity must survive CLC work-tile boundaries.  A
+        # causal tile may contain an odd number of K blocks, so restarting the
+        # next tile at slot 0 disagrees with the softmax producer and deadlocks.
+        kpp_iter_global = Int32(0)
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
@@ -1803,10 +1824,16 @@ class FlashAttentionForwardHd256_2CTA_Sm100:
                 sK_cur = sK[None, None, None, Ki_index]
                 if const_expr(self.uneven_kv_smem):
                     sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
-                gemm_Si[0](
-                    smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator)
-                )
-                pipeline_s_full_kpp.producer_commit_w_index(0)
+                initial_s_slot = kpp_iter_global % self.s_pp
+                if initial_s_slot == 0:
+                    gemm_Si[0](
+                        smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator)
+                    )
+                else:
+                    gemm_Si[1](
+                        smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator)
+                    )
+                pipeline_s_full_kpp.producer_commit_w_index(initial_s_slot)
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 mma_kv_consumer_state.advance()
                 mma_q_consumer_phase ^= 1
@@ -1828,7 +1855,7 @@ class FlashAttentionForwardHd256_2CTA_Sm100:
                     sK_cur = sK[None, None, None, Ki_index]
                     if const_expr(self.uneven_kv_smem):
                         sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
-                    next_s_slot = (i + 1) % self.s_pp
+                    next_s_slot = (kpp_iter_global + i + 1) % self.s_pp
                     if next_s_slot == 0:
                         gemm_Si[0](
                             smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator)
@@ -1841,7 +1868,7 @@ class FlashAttentionForwardHd256_2CTA_Sm100:
                     pipeline_kv.consumer_release(k_next_state)
                     mma_kv_consumer_state.advance()
 
-                    cur_p_slot = i % self.s_pp
+                    cur_p_slot = (kpp_iter_global + i) % self.s_pp
                     pipeline_p_full_kpp.consumer_wait(kpp_p_full_consumer_state)
                     pipeline_o_rescaled_kpp.consumer_wait(kpp_o_rescaled_consumer_state)
                     p_lastsplit_phase = kpp_p_full_consumer_state.phase
@@ -1879,7 +1906,7 @@ class FlashAttentionForwardHd256_2CTA_Sm100:
                 pipeline_kv.consumer_wait(mma_kv_consumer_state)
                 Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                 tOrVi = tOrV[None, None, None, Vi_index]
-                final_p_slot = (block_iter_count - 1) % self.s_pp
+                final_p_slot = (kpp_iter_global + block_iter_count - 1) % self.s_pp
                 pipeline_p_full_kpp.consumer_wait(kpp_p_full_consumer_state)
                 pipeline_o_rescaled_kpp.consumer_wait(kpp_o_rescaled_consumer_state)
                 p_lastsplit_phase = kpp_p_full_consumer_state.phase
@@ -1911,6 +1938,7 @@ class FlashAttentionForwardHd256_2CTA_Sm100:
                 kpp_o_rescaled_consumer_state.advance()
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 mma_kv_consumer_state.advance()
+                kpp_iter_global += block_iter_count
 
             if process_tile and is_leader_cta and const_expr(
                 not (
@@ -2265,7 +2293,12 @@ class FlashAttentionForwardHd256_2CTA_Sm100:
 
             qk_descale, _ = self._load_effective_descales(descale_tensors, batch_idx, kv_head_idx)
 
-            max_offset = 8 if cutlass.const_expr(self.q_dtype.width == 8) else 0
+            # P is scaled before the e4m3 cast to reduce underflow.  The running
+            # row max can lag the true max by rescale_threshold (4) log2 units,
+            # so max_offset=8 can produce values up to 2^12 and saturate e4m3
+            # (max 448).  Keep offset + threshold <= 8, matching the corrected
+            # 1-CTA FP8 path.
+            max_offset = 4 if cutlass.const_expr(self.q_dtype.width == 8) else 0
             if const_expr(self.score_mod is None):
                 softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
                 softmax_scale_eff = None
@@ -2867,9 +2900,10 @@ class FlashAttentionForwardHd256_2CTA_Sm100:
             else:
                 softmax_scale_log2_eff = softmax_scale_log2
 
-            max_offset = Float32(8.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(0.0)
+            # Must match the P-path scale above (2^max_offset).
+            max_offset = Float32(4.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(0.0)
             max_offset_scale = (
-                Float32(256.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(1.0)
+                Float32(16.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(1.0)
             )
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)

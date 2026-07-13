@@ -571,7 +571,7 @@ def _flash_attn_fwd(
     fwd_kernel_variant = (
         "hd256_fp8_main"
         if use_fp8_hd256_main
-        else "hd256_fp8_2cta"
+        else "hd256_fp8_2cta_v2"
         if use_fp8_hd256_2cta
         else "hd256_fp8_1cta" if use_fp8_hd256_1cta else "default"
     )

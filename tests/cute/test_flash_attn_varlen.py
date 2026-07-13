@@ -91,6 +91,54 @@ def test_varlen_hd256_fp8_1cta_sm100_oracle():
     ref = out_main.abs().max().item()
     assert diff <= 1e-2 + 0.02 * ref
 
+
+def test_varlen_hd256_fp8_2cta_causal_matches_1cta():
+    """A 2-CTA pair must include the K-block range needed by its second CTA."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 11):
+        pytest.skip("SM100/SM110-specific hd256 fp8 2CTA regression test")
+
+    torch.manual_seed(0)
+    fp8 = torch.float8_e4m3fn
+    seqlen, nheads_q, nheads_kv, d = 256, 4, 1, 256
+    q = torch.randn(seqlen, nheads_q, d, device="cuda", dtype=torch.bfloat16).to(fp8)
+    k = torch.randn(seqlen, nheads_kv, d, device="cuda", dtype=torch.bfloat16).to(fp8)
+    v = torch.randn(seqlen, nheads_kv, d, device="cuda", dtype=torch.bfloat16).to(fp8)
+    cu_seqlens = torch.tensor([0, seqlen], device="cuda", dtype=torch.int32)
+
+    def run(use_2cta):
+        old_main = os.environ.get("FA_HD256_USE_MAIN")
+        old_2cta = os.environ.get("FA_HD256_2CTA")
+        os.environ["FA_HD256_USE_MAIN"] = "0"
+        os.environ["FA_HD256_2CTA"] = "1" if use_2cta else "0"
+        try:
+            out, _ = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=seqlen,
+                max_seqlen_k=seqlen,
+                softmax_scale=1.0 / d**0.5,
+                causal=True,
+                pack_gqa=False,
+            )
+        finally:
+            if old_main is None:
+                os.environ.pop("FA_HD256_USE_MAIN", None)
+            else:
+                os.environ["FA_HD256_USE_MAIN"] = old_main
+            if old_2cta is None:
+                os.environ.pop("FA_HD256_2CTA", None)
+            else:
+                os.environ["FA_HD256_2CTA"] = old_2cta
+        return out
+
+    out_1cta = run(use_2cta=False)
+    out_2cta = run(use_2cta=True)
+    torch.testing.assert_close(out_2cta, out_1cta, rtol=0, atol=0)
+
+
 def check_varlen_vs_torch_flash(
     q, k, v,
     cu_seqlens_q=None,
