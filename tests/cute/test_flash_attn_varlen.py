@@ -1,10 +1,12 @@
 from typing import Optional
 import os
+from unittest import mock
 import pytest
 
 import torch
 import torch.nn.functional as F
 from flash_attn.cute import flash_attn_varlen_func
+from flash_attn.cute import utils as cute_utils
 
 @pytest.mark.parametrize("B", [1, 7, 20])
 @pytest.mark.parametrize("H", [1, 4, 6])
@@ -137,6 +139,48 @@ def test_varlen_hd256_fp8_2cta_causal_matches_1cta():
     out_1cta = run(use_2cta=False)
     out_2cta = run(use_2cta=True)
     torch.testing.assert_close(out_2cta, out_1cta, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("nheads_q,nheads_kv", [(32, 2), (16, 1), (8, 1), (16, 2), (32, 1)])
+def test_varlen_hd256_fp8_clc_kpp_matches_static_after_work_steal(nheads_q, nheads_kv):
+    """Odd causal K-block counts must preserve KPP parity across CLC tiles."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 11):
+        pytest.skip("SM100/SM110-specific hd256 fp8 CLC regression test")
+
+    torch.manual_seed(0)
+    fp8 = torch.float8_e4m3fn
+    seqlen, d = 1024, 256
+    q = torch.randn(seqlen, nheads_q, d, device="cuda", dtype=torch.bfloat16).to(fp8)
+    k = torch.randn(seqlen, nheads_kv, d, device="cuda", dtype=torch.bfloat16).to(fp8)
+    v = torch.randn(seqlen, nheads_kv, d, device="cuda", dtype=torch.bfloat16).to(fp8)
+    cu_seqlens = torch.tensor([0, seqlen], device="cuda", dtype=torch.int32)
+
+    def run(use_clc):
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"FA_CLC": "1" if use_clc else "0", "FA_HD256_USE_MAIN": "0", "FA_HD256_2CTA": "0"},
+                clear=False,
+            ),
+            mock.patch.object(cute_utils, "_fa_clc_enabled", use_clc),
+        ):
+            out, _ = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=seqlen,
+                max_seqlen_k=seqlen,
+                softmax_scale=1.0 / d**0.5,
+                causal=True,
+                pack_gqa=False,
+            )
+            return out
+
+    out_static = run(use_clc=False)
+    out_clc = run(use_clc=True)
+    torch.testing.assert_close(out_clc, out_static, rtol=0, atol=0)
 
 
 def check_varlen_vs_torch_flash(

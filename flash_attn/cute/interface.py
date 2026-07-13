@@ -656,6 +656,30 @@ def _flash_attn_fwd(
     is_dense_noncausal = not is_varlen and not causal and not local
     use_clc_scheduler = requested_use_clc_scheduler and not is_varlen_mha and not is_dense_noncausal
 
+    # NCU-vetted B300 hd256 FP8 causal-varlen GQA shapes.  Keep auto-selection
+    # deliberately inside the measured envelope: one equal-length sequence,
+    # 8K+, and the five production head configurations below.  Other shapes
+    # remain opt-in through FA_CLC.
+    auto_use_clc_hd256_fp8 = (
+        arch == 103
+        and os.environ.get("FA_CLC") is None
+        and use_fp8_hd256_1cta
+        and not use_fp8_hd256_2cta
+        and causal
+        and is_varlen
+        and not local
+        and not is_split_kv
+        and not pack_gqa
+        and batch_size == 1
+        and max_seqlen_q == max_seqlen_k
+        and max_seqlen_q >= 8192
+        and (num_head, num_head_kv) in ((32, 2), (16, 1), (8, 1), (16, 2), (32, 1))
+    )
+    use_clc_scheduler = use_clc_scheduler or auto_use_clc_hd256_fp8
+    if use_fp8_hd256_1cta and not use_fp8_hd256_2cta and use_clc_scheduler:
+        # Do not reuse pre-parity-fix CLC cubins from the persistent cache.
+        fwd_kernel_variant = "hd256_fp8_1cta_clc_v4"
+
     if use_block_sparsity:
         # NB: pack_gqa requires block sparse head dim == 1 (broadcasted)
         head_dim_idx = 0 if block_sparse_tensors.mask_block_cnt.ndim == 2 else 1

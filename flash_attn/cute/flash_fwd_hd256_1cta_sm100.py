@@ -319,7 +319,16 @@ class FlashAttentionForwardHd256_1CTA_Sm100:
             self.load_warp_ids = (10,)
             self.empty_warp_ids = ()
 
-        self.clc_scheduler_warp_id = self.empty_warp_ids[0] if self.use_clc_scheduler else None
+        # Compact hd256 FP8 has no parked warp.  Its TMA load warp finishes
+        # issuing a tile well before the long causal compute pipeline drains,
+        # so let it prefetch the next CLC response instead of adding an 11th
+        # warp solely for scheduling.
+        self.clc_on_load_warp = self.use_clc_scheduler and not self.empty_warp_ids
+        self.clc_scheduler_warp_id = (
+            self.empty_warp_ids[0]
+            if self.use_clc_scheduler and not self.clc_on_load_warp
+            else None
+        )
 
         self.threads_per_cta = cute.arch.WARP_SIZE * len(
             (
@@ -1219,7 +1228,7 @@ class FlashAttentionForwardHd256_1CTA_Sm100:
         # ///////////////////////////////////////////////////////////////////////////////
         #  EMPTY / CLC SCHEDULER WARP
         # ///////////////////////////////////////////////////////////////////////////////
-        if const_expr(self.use_clc_scheduler):
+        if const_expr(self.use_clc_scheduler and not self.clc_on_load_warp):
             if warp_idx == self.clc_scheduler_warp_id:
                 cute.arch.setmaxregister_decrease(self.num_regs_other)
                 if is_leader_cta:
@@ -1625,6 +1634,8 @@ class FlashAttentionForwardHd256_1CTA_Sm100:
                 )
 
 
+            if const_expr(self.clc_on_load_warp):
+                tile_scheduler.prefetch_next_work()
             work_tile = tile_scheduler.advance_to_next_work()
             # End of persistent scheduler loop
 
@@ -1633,6 +1644,8 @@ class FlashAttentionForwardHd256_1CTA_Sm100:
         # This is equivalent to pipeline_q.producer_tail for the TMA-Q producer warp.
         if issue_q_for_this_warp:
             pipeline_q.producer_acquire_w_index_phase(self.q_stage - 1, q_producer_phase)
+        if const_expr(self.clc_on_load_warp):
+            tile_scheduler.producer_tail()
 
     @cute.jit
     def mma(
@@ -1755,6 +1768,10 @@ class FlashAttentionForwardHd256_1CTA_Sm100:
         kpp_o_rescaled_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, 1
         )
+        # K-ping-pong slot parity must survive CLC work-tile boundaries.  A
+        # causal tile may contain an odd number of K blocks, so restarting the
+        # next tile at slot 0 disagrees with the softmax producer and deadlocks.
+        kpp_iter_global = Int32(0)
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
@@ -1800,10 +1817,16 @@ class FlashAttentionForwardHd256_1CTA_Sm100:
                 sK_cur = sK[None, None, None, Ki_index]
                 if const_expr(self.uneven_kv_smem):
                     sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
-                gemm_Si[0](
-                    smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator)
-                )
-                pipeline_s_full_kpp.producer_commit_w_index(0)
+                initial_s_slot = kpp_iter_global % self.s_pp
+                if initial_s_slot == 0:
+                    gemm_Si[0](
+                        smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator)
+                    )
+                else:
+                    gemm_Si[1](
+                        smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator)
+                    )
+                pipeline_s_full_kpp.producer_commit_w_index(initial_s_slot)
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 mma_kv_consumer_state.advance()
                 mma_q_consumer_phase ^= 1
@@ -1825,7 +1848,7 @@ class FlashAttentionForwardHd256_1CTA_Sm100:
                     sK_cur = sK[None, None, None, Ki_index]
                     if const_expr(self.uneven_kv_smem):
                         sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
-                    next_s_slot = (i + 1) % self.s_pp
+                    next_s_slot = (kpp_iter_global + i + 1) % self.s_pp
                     if next_s_slot == 0:
                         gemm_Si[0](
                             smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator)
@@ -1838,7 +1861,7 @@ class FlashAttentionForwardHd256_1CTA_Sm100:
                     pipeline_kv.consumer_release(k_next_state)
                     mma_kv_consumer_state.advance()
 
-                    cur_p_slot = i % self.s_pp
+                    cur_p_slot = (kpp_iter_global + i) % self.s_pp
                     pipeline_p_full_kpp.consumer_wait(kpp_p_full_consumer_state)
                     pipeline_o_rescaled_kpp.consumer_wait(kpp_o_rescaled_consumer_state)
                     p_lastsplit_phase = kpp_p_full_consumer_state.phase
@@ -1876,7 +1899,7 @@ class FlashAttentionForwardHd256_1CTA_Sm100:
                 pipeline_kv.consumer_wait(mma_kv_consumer_state)
                 Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                 tOrVi = tOrV[None, None, None, Vi_index]
-                final_p_slot = (block_iter_count - 1) % self.s_pp
+                final_p_slot = (kpp_iter_global + block_iter_count - 1) % self.s_pp
                 pipeline_p_full_kpp.consumer_wait(kpp_p_full_consumer_state)
                 pipeline_o_rescaled_kpp.consumer_wait(kpp_o_rescaled_consumer_state)
                 p_lastsplit_phase = kpp_p_full_consumer_state.phase
@@ -1908,6 +1931,22 @@ class FlashAttentionForwardHd256_1CTA_Sm100:
                 kpp_o_rescaled_consumer_state.advance()
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 mma_kv_consumer_state.advance()
+                kpp_iter_global += block_iter_count
+
+                # Normalize the two S/P barrier rings at an odd causal tile
+                # boundary without executing a duplicate QK/PV block.  CLC can
+                # then hand this CTA another tile while every S/P ring starts
+                # from slot 0 again.  K/V and O pipelines keep their own
+                # continuous states and need no padding.
+                if const_expr(self.use_clc_scheduler) and block_iter_count % self.s_pp != 0:
+                    dummy_slot = kpp_iter_global % self.s_pp
+                    pipeline_s_full_kpp.producer_commit_w_index(dummy_slot)
+                    pipeline_p_full_kpp.consumer_wait(kpp_p_full_consumer_state)
+                    pipeline_p_full_lastsplit_kpp.consumer_wait(kpp_p_full_consumer_state)
+                    pipeline_p_full_kpp.consumer_release(kpp_p_full_consumer_state)
+                    pipeline_p_full_lastsplit_kpp.consumer_release(kpp_p_full_consumer_state)
+                    kpp_p_full_consumer_state.advance()
+                    kpp_iter_global += 1
 
             if process_tile and is_leader_cta and const_expr(
                 not (
@@ -2578,6 +2617,20 @@ class FlashAttentionForwardHd256_1CTA_Sm100:
                                     )
                                 )
                             # Now that we no longer already have the 1st iteration, need mask_seqlen=True here
+
+                    # Match MMA's barrier-only parity normalization.  No score,
+                    # probability, or V tile is computed for this dummy stage.
+                    if const_expr(use_kpp and self.use_clc_scheduler) and tile_block_count % self.s_pp != 0:
+                        s_phase = k_iter // self.s_pp
+                        p_phase = s_phase + 1
+                        dummy_slot = k_iter % self.s_pp
+                        pipeline_s_full_kpp.consumer_wait_w_index_phase(dummy_slot, s_phase)
+                        pipeline_p_full_kpp.producer_acquire_w_index_phase(dummy_slot, p_phase)
+                        cute.arch.sync_warp()
+                        with cute.arch.elect_one():
+                            pipeline_p_full_kpp.producer_commit_w_index(dummy_slot)
+                            pipeline_p_full_lastsplit_kpp.producer_commit_w_index(dummy_slot)
+                        k_iter += 1
 
                     # Dense path always writes scale / signals
                     sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
