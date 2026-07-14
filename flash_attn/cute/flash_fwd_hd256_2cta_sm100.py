@@ -100,6 +100,10 @@ _FP8_TUNING_CONFIG = {
     # (0.94x), hence keyed on is_causal=True only.
     (False, True, 128, False): {'ex2_emu_freq': 8, 'ex2_emu_start_frg': 1},
     (False, True, 256, True): {'ex2_emu_freq': 0, 'ex2_emu_start_frg': 0, 'num_regs_softmax': 160, 'num_regs_correction': 120, 'num_regs_other': 96},
+    # The compact causal 2CTA path has one softmax WG and one correction WG.
+    # Keep the correction epilogue at the same allocation as the spill-free
+    # 1CTA specialization instead of inheriting the generic 80-register cap.
+    (True, True, 256, True): {'ex2_emu_freq': 0, 'ex2_emu_start_frg': 0, 'num_regs_softmax': 160, 'num_regs_correction': 128, 'num_regs_other': 96},
 }
 _FP8_SMALL_HDIM_REGS = {
     False: {"num_regs_softmax": 168, "num_regs_correction": 96, "num_regs_other": 80},
@@ -322,21 +326,16 @@ class FlashAttentionForwardHd256_2CTA_Sm100:
             self.load_warp_ids = (10,)
             self.empty_warp_ids = ()
 
-        # The compact hd256 FP8 layouts deliberately remove every parked warp.
-        # CLC still needs one dedicated producer warp to issue work queries, so
-        # append it only to the CLC specialization instead of making the static
-        # fast path pay for an otherwise idle warp.
-        if self.use_clc_scheduler and not self.empty_warp_ids:
-            used_warp_ids = (
-                *self.softmax0_warp_ids,
-                *self.softmax1_warp_ids,
-                *self.correction_warp_ids,
-                self.mma_warp_id,
-                *self.load_warp_ids,
-                *(() if self.epilogue_warp_ids == self.correction_warp_ids else self.epilogue_warp_ids),
-            )
-            self.empty_warp_ids = (max(used_warp_ids) + 1,)
-        self.clc_scheduler_warp_id = self.empty_warp_ids[0] if self.use_clc_scheduler else None
+        # The compact hd256 FP8 layout has no parked warp.  The TMA load warp
+        # finishes issuing a tile before the causal compute pipeline drains, so
+        # let the leader CTA's load warp prefetch the next cluster-level CLC
+        # response instead of adding an 11th warp to both CTAs.
+        self.clc_on_load_warp = self.use_clc_scheduler and not self.empty_warp_ids
+        self.clc_scheduler_warp_id = (
+            self.empty_warp_ids[0]
+            if self.use_clc_scheduler and not self.clc_on_load_warp
+            else None
+        )
 
         self.threads_per_cta = cute.arch.WARP_SIZE * len(
             (
@@ -408,6 +407,8 @@ class FlashAttentionForwardHd256_2CTA_Sm100:
         # per-stage state, so at hd_padded=16 the unbounded formula picks 52 stages
         # and overflows the 227 KB SMEM cap. No-op for hd_padded >= 32 (max 26).
         kv_stage = min((224 * 1024 - smem_size_q_o) // smem_size_kv_per_stage, 32)
+        if self.use_2cta_instrs and self.head_dim_padded == 256:
+            kv_stage = min(kv_stage, 4)
         if self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and kv_stage == 2:
             # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem
              kv_stage = 3
@@ -1118,6 +1119,39 @@ class FlashAttentionForwardHd256_2CTA_Sm100:
                 defer_sync=True,
             )
 
+        # Initialize the CLC mbarriers before the common cluster-init fence so
+        # they share the same synchronization as the Q/KV/compute pipelines.
+        # CUTLASS's Blackwell CLC kernels use this ordering with defer_sync=True;
+        # constructing this pipeline after pipeline_init_wait would otherwise
+        # introduce a second cluster-wide initialization barrier.
+        if const_expr(self.use_clc_scheduler):
+            clc_response_ptr = storage.clc_response.data_ptr()
+            clc_mbar_ptr = storage.clc_mbar_ptr.data_ptr()
+
+            clc_pipeline_producer_group = cutlass_pipeline.CooperativeGroup(
+                cutlass_pipeline.Agent.Thread
+            )
+            num_clc_consumer_warps_per_cta = self.threads_per_cta // cute.arch.WARP_SIZE
+            num_clc_consumer_warps = num_clc_consumer_warps_per_cta * self.cta_group_size
+            clc_pipeline_consumer_group = cutlass_pipeline.CooperativeGroup(
+                cutlass_pipeline.Agent.Thread, cute.arch.WARP_SIZE * num_clc_consumer_warps
+            )
+            clc_pipeline = cutlass_pipeline.PipelineClcFetchAsync.create(
+                barrier_storage=clc_mbar_ptr,
+                num_stages=self.sched_stages,
+                producer_group=clc_pipeline_producer_group,
+                consumer_group=clc_pipeline_consumer_group,
+                tx_count=16,
+                cta_layout_vmnk=cta_layout_vmnk,
+                defer_sync=True,
+            )
+            clc_consumer_state = cutlass_pipeline.make_pipeline_state(
+                cutlass_pipeline.PipelineUserType.Consumer, self.sched_stages
+            )
+            clc_producer_state = cutlass_pipeline.make_pipeline_state(
+                cutlass_pipeline.PipelineUserType.Producer, self.sched_stages
+            )
+
         # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=cta_layout_vmnk, is_relaxed=True)
 
@@ -1195,19 +1229,6 @@ class FlashAttentionForwardHd256_2CTA_Sm100:
         pipeline_init_wait(cluster_shape_mn=cta_layout_vmnk)
 
         if const_expr(self.use_clc_scheduler):
-            clc_response_ptr = storage.clc_response.data_ptr()
-            clc_mbar_ptr = storage.clc_mbar_ptr.data_ptr()
-
-            clc_pipeline_producer_group = cutlass_pipeline.CooperativeGroup(
-                cutlass_pipeline.Agent.Thread
-            )
-            num_clc_consumer_warps_per_cta = self.threads_per_cta // cute.arch.WARP_SIZE
-            # NB on CTA0 warp15 == scheduler on CTA1 == empty but still both consume
-            num_clc_consumer_warps = num_clc_consumer_warps_per_cta * self.cta_group_size
-            clc_pipeline_consumer_group = cutlass_pipeline.CooperativeGroup(
-                cutlass_pipeline.Agent.Thread, cute.arch.WARP_SIZE * num_clc_consumer_warps
-            )
-
             block_idx = cute.arch.block_idx()
             clc = ClcState.create(
                 hw_scheduler=ClcDynamicPersistentTileScheduler.create(
@@ -1216,20 +1237,9 @@ class FlashAttentionForwardHd256_2CTA_Sm100:
                     cute.arch.grid_dim(),
                     clc_response_ptr,
                 ),
-                pipeline=cutlass_pipeline.PipelineClcFetchAsync.create(
-                    barrier_storage=clc_mbar_ptr,
-                    num_stages=self.sched_stages,
-                    producer_group=clc_pipeline_producer_group,
-                    consumer_group=clc_pipeline_consumer_group,
-                    tx_count=16,
-                    cta_layout_vmnk=cta_layout_vmnk,
-                ),
-                consumer_state=cutlass_pipeline.make_pipeline_state(
-                    cutlass_pipeline.PipelineUserType.Consumer, self.sched_stages
-                ),
-                producer_state=cutlass_pipeline.make_pipeline_state(
-                    cutlass_pipeline.PipelineUserType.Producer, self.sched_stages
-                ),
+                pipeline=clc_pipeline,
+                consumer_state=clc_consumer_state,
+                producer_state=clc_producer_state,
             )
             tile_scheduler = self.tile_scheduler_cls.create(tile_sched_params, clc=clc)
         else:
@@ -1239,7 +1249,7 @@ class FlashAttentionForwardHd256_2CTA_Sm100:
         # ///////////////////////////////////////////////////////////////////////////////
         #  EMPTY / CLC SCHEDULER WARP
         # ///////////////////////////////////////////////////////////////////////////////
-        if const_expr(self.use_clc_scheduler):
+        if const_expr(self.use_clc_scheduler and not self.clc_on_load_warp):
             if warp_idx == self.clc_scheduler_warp_id:
                 cute.arch.setmaxregister_decrease(self.num_regs_other)
                 if is_leader_cta:
@@ -1280,6 +1290,7 @@ class FlashAttentionForwardHd256_2CTA_Sm100:
                 num_splits,
                 SeqlenInfoCls,
                 blocksparse_tensors,
+                is_leader_cta,
                 tile_scheduler=tile_scheduler,
             )
 
@@ -1454,6 +1465,7 @@ class FlashAttentionForwardHd256_2CTA_Sm100:
         num_splits: Int32,
         SeqlenInfoCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors],
+        is_leader_cta: Boolean,
         tile_scheduler: TileSchedulerProtocol,
     ):
         num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
@@ -1645,6 +1657,9 @@ class FlashAttentionForwardHd256_2CTA_Sm100:
                 )
 
 
+            if const_expr(self.clc_on_load_warp):
+                if is_leader_cta:
+                    tile_scheduler.prefetch_next_work()
             work_tile = tile_scheduler.advance_to_next_work()
             # End of persistent scheduler loop
 
@@ -1653,6 +1668,9 @@ class FlashAttentionForwardHd256_2CTA_Sm100:
         # This is equivalent to pipeline_q.producer_tail for the TMA-Q producer warp.
         if issue_q_for_this_warp:
             pipeline_q.producer_acquire_w_index_phase(self.q_stage - 1, q_producer_phase)
+        if const_expr(self.clc_on_load_warp):
+            if is_leader_cta:
+                tile_scheduler.producer_tail()
 
     @cute.jit
     def mma(

@@ -94,8 +94,9 @@ def test_varlen_hd256_fp8_1cta_sm100_oracle():
     assert diff <= 1e-2 + 0.02 * ref
 
 
-def test_varlen_hd256_fp8_2cta_causal_matches_1cta():
-    """A 2-CTA pair must include the K-block range needed by its second CTA."""
+@pytest.mark.parametrize("use_clc", [False, True], ids=["static", "clc"])
+def test_varlen_hd256_fp8_2cta_causal_matches_1cta(use_clc):
+    """Both static and CLC 2CTA must match the corresponding 1CTA path."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 11):
         pytest.skip("SM100/SM110-specific hd256 fp8 2CTA regression test")
 
@@ -108,11 +109,18 @@ def test_varlen_hd256_fp8_2cta_causal_matches_1cta():
     cu_seqlens = torch.tensor([0, seqlen], device="cuda", dtype=torch.int32)
 
     def run(use_2cta):
-        old_main = os.environ.get("FA_HD256_USE_MAIN")
-        old_2cta = os.environ.get("FA_HD256_2CTA")
-        os.environ["FA_HD256_USE_MAIN"] = "0"
-        os.environ["FA_HD256_2CTA"] = "1" if use_2cta else "0"
-        try:
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "FA_CLC": "1" if use_clc else "0",
+                    "FA_HD256_USE_MAIN": "0",
+                    "FA_HD256_2CTA": "1" if use_2cta else "0",
+                },
+                clear=False,
+            ),
+            mock.patch.object(cute_utils, "_fa_clc_enabled", use_clc),
+        ):
             out, _ = flash_attn_varlen_func(
                 q,
                 k,
@@ -125,15 +133,6 @@ def test_varlen_hd256_fp8_2cta_causal_matches_1cta():
                 causal=True,
                 pack_gqa=False,
             )
-        finally:
-            if old_main is None:
-                os.environ.pop("FA_HD256_USE_MAIN", None)
-            else:
-                os.environ["FA_HD256_USE_MAIN"] = old_main
-            if old_2cta is None:
-                os.environ.pop("FA_HD256_2CTA", None)
-            else:
-                os.environ["FA_HD256_2CTA"] = old_2cta
         return out
 
     out_1cta = run(use_2cta=False)
